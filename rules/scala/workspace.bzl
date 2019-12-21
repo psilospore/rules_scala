@@ -33,6 +33,11 @@ def scala_repositories(java_launcher_version = "0.29.1"):
             "ch.epfl.scala:bloop-frontend_2.12:1.0.0",
             "com.thesamet.scalapb:scalapb-runtime_2.12:0.9.0",
             "org.scala-sbt:util-logging_2.12:1.2.0",
+            "ch.epfl.scala:bsp4j:2.0.0-M4+10-61e61e87", #maybe the socket library and others
+            "ch.epfl.scala:bloop-config_2.12:1.2.5",
+            "ch.epfl.scala:bloop-launcher-core_2.12:1.3.5",
+            "org.scala-lang.modules:scala-java8-compat_2.12:0.8.0",
+            "com.kohlschutter.junixsocket:junixsocket-core:2.2.0"
         ],
         repositories = [
             "http://central.maven.org/maven2",

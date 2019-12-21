@@ -7,52 +7,66 @@ import workers.common.CommonArguments
 import workers.common.FileUtil
 import workers.common.LoggedReporter
 import common.worker.WorkerMain
-
 import com.google.devtools.build.buildjar.jarhelper.JarCreator
-import java.io.{File, PrintWriter}
-import java.nio.file.{Files, NoSuchFileException, Path, Paths}
-import java.util.{List => JList, Optional, Properties}
+import java.io.{File, InputStream, PrintWriter}
+import java.nio.file.{FileSystems, Files, NoSuchFileException, Path, Paths}
+import java.util.concurrent.Executors
+import java.util.{Optional, Properties, List => JList}
+
+import bloop.bloopgun.core.Shell
+import bloop.config.Config.Scala
 import net.sourceforge.argparse4j.ArgumentParsers
 import net.sourceforge.argparse4j.impl.{Arguments => Arg}
 import net.sourceforge.argparse4j.inf.Namespace
 import sbt.internal.inc.classpath.ClassLoaderCache
-import sbt.internal.inc.{Analysis, CompileFailed, IncrementalCompilerImpl, Locate, ZincUtil}
+
 import scala.collection.JavaConverters._
 import scala.util.Try
 import scala.util.control.NonFatal
-import xsbti.Logger
-import xsbti.compile.AnalysisContents
-import xsbti.compile.ClasspathOptionsUtil
-import xsbti.compile.CompileAnalysis
-import xsbti.compile.CompileOptions
+
 import xsbti.compile.CompilerCache
-import xsbti.compile.DefinesClass
-import xsbti.compile.IncOptions
-import xsbti.compile.Inputs
-import xsbti.compile.PerClasspathEntryLookup
-import xsbti.compile.PreviousResult
-import xsbti.compile.Setup
+
+import ch.epfl.scala.bsp4j._
+import bloop.config.ConfigEncoderDecoders._
+import bloop.config.{Config => BloopConfig}
+import bloop.launcher.LauncherStatus.SuccessfulRun
+import bloop.launcher.{Launcher => BloopLauncher}
+import bloop.launcher.bsp.BspBridge
+import org.eclipse.lsp4j.jsonrpc.{Launcher => LspLauncher}
+
+import scala.compat.java8.FutureConverters._
+import scala.collection.JavaConverters._
+import scala.concurrent.Promise
+import scala.concurrent.ExecutionContext.Implicits.global
 
 /**
- * <strong>Caching</strong>
- *
- * Zinc has two caches:
- *  1. a ClassLoaderCache which is a soft reference cache for classloaders of Scala compilers.
- *  2. a CompilerCache which is a hard reference cache for (I think) Scala compiler instances.
- *
- * The CompilerCache has reproducibility issues, so it needs to be a no-op.
- * The ClassLoaderCache needs to be reused else JIT reuse (i.e. the point of the worker strategy) doesn't happen.
- *
- * There are two sensible strategies for Bazel workers
- *  A. Each worker compiles multiple Scala versions. Trust the ClassLoaderCache's timestamp check. Maintain a hard
- *     reference to the classloader for the last version, and allow previous versions to be GC'ed subject to
- *     free memory and -XX:SoftRefLRUPolicyMSPerMB.
- *  B. Each worker compiles a single Scala version. Probably still use ClassLoaderCache + hard reference since
- *     ClassLoaderCache is hard to remove. The compiler classpath is passed via the initial flags to the worker
- *     (rather than the per-request arg file). Bazel worker management cycles out Scala compiler versions.
- * Currently, this runner follows strategy A.
+ * Can't figure out how to invoke BloopRunner so I'm just gonna rip this up and replace it then figure that part out later
+ * `bazel run //hello:hello_run --worker_extra_flag=ScalaCompile=--persistence_dir=.bazel-zinc`
  */
 object ZincRunner extends WorkerMain[Namespace] {
+
+  trait BloopServer extends BuildServer with ScalaBuildServer
+
+  //At the moment just print results
+  val printClient = new BuildClient {
+    override def onBuildShowMessage(params: ShowMessageParams): Unit = println("onBuildShowMessage", params)
+
+    override def onBuildLogMessage(params: LogMessageParams): Unit = println("onBuildLogMessage", params)
+
+    override def onBuildTaskStart(params: TaskStartParams): Unit = println("onBuildTaskStart", params)
+
+    override def onBuildTaskProgress(params: TaskProgressParams): Unit = println("onBuildTaskProgress", params)
+
+    //TODO handle this probably contains class files and I might write it to .bloop/out/classes/ then other bazel targets can point to this if this is a dep
+    override def onBuildTaskFinish(params: TaskFinishParams): Unit = {
+      println("onBuildTaskFinish", params)
+    }
+
+    override def onBuildPublishDiagnostics(params: PublishDiagnosticsParams): Unit = println("onBuildPublishDiagnostics", params)
+
+    override def onBuildTargetDidChange(params: DidChangeBuildTarget): Unit = println("onBuildTargetDidChange", params)
+  }
+
 
   private[this] val classloaderCache = new ClassLoaderCache(null)
 
@@ -61,7 +75,9 @@ object ZincRunner extends WorkerMain[Namespace] {
   // prevents GC of the soft reference in classloaderCache
   private[this] var lastCompiler: AnyRef = null
 
-  private[this] def labelToPath(label: String) = Paths.get(label.replaceAll("^/+", "").replaceAll(raw"[^\w/]", "_"))
+  private[this] def labelToPath(label: String) = Paths.get(label.replaceAll("^/+", "").replaceAll(raw"[^\w/]", "/"))
+
+  private[this] var bloopServer: BloopServer = null
 
   protected[this] def init(args: Option[Array[String]]) = {
     val parser = ArgumentParsers.newFor("zinc-worker").addHelp(true).build
@@ -69,7 +85,59 @@ object ZincRunner extends WorkerMain[Namespace] {
     parser.addArgument("--use_persistence").`type`(Arg.booleanType)
     // deprecated
     parser.addArgument("--max_errors")
+
+    val emptyInputStream = new InputStream() {
+      override def read(): Int = -1
+    }
+
+    val dir = Files.createTempDirectory(s"bsp-launcher")
+    val bspBridge = new BspBridge(
+      emptyInputStream,
+      System.out,
+      Promise[Unit](),
+      System.out,
+      Shell.default,
+      dir
+    )
+
+    //TODO move to init we get a work request in sequence A, B, C, C_run
+    BloopLauncher.connectToBloopBspServer("1.1.2", false, bspBridge, List()) match {
+      case Right(Right(Some(socket))) => {
+        val es = Executors.newCachedThreadPool()
+
+        val launcher = new LspLauncher.Builder[BloopServer]()
+          .setRemoteInterface(classOf[BloopServer])
+          .setExecutorService(es)
+          .setInput(socket.getInputStream)
+          .setOutput(socket.getOutputStream)
+          .setLocalService(printClient)
+          .create()
+
+        launcher.startListening()
+        bloopServer = launcher.getRemoteProxy
+
+        printClient.onConnectWithServer(bloopServer)
+
+        println("attempting build initialize")
+
+        val initBuildParams = new InitializeBuildParams(
+          "bsp",
+          "1.3.4",
+          "2.0",
+          s"file:///Users/syedajafri/dev/bazelExample", //TODO don't hardcode
+          new BuildClientCapabilities(List("scala").asJava)
+        )
+
+        bloopServer.buildInitialize(initBuildParams).toScala.foreach(initializeResults => {
+          println(s"initialized: Results $initializeResults")
+          bloopServer.onBuildInitialized()
+        })
+      }
+    }
+    Thread.sleep(1000)
+
     parser.parseArgsOrFail(args.getOrElse(Array.empty))
+
   }
 
   protected[this] def work(worker: Namespace, args: Array[String]) = {
@@ -79,215 +147,68 @@ object ZincRunner extends WorkerMain[Namespace] {
 
     val logger = new AnnexLogger(namespace.getString("log_level"))
 
-    val tmpDir = namespace.get[File]("tmp").toPath
+    logger.error(() => s"hii: $worker args ${args.toList}")
 
-    // extract srcjars
-    val sources = {
-      val sourcesDir = tmpDir.resolve("src")
-      namespace.getList[File]("sources").asScala ++
-        namespace
-          .getList[File]("source_jars")
-          .asScala
-          .zipWithIndex
-          .flatMap {
-            case (jar, i) => FileUtil.extractZip(jar.toPath, sourcesDir.resolve(i.toString))
-          }
-          .map(_.toFile)
-    }
+    //TODO figure out how to pass workspace dir from bazel
+    val workspaceDir = namespace.get[File]("workspace_dir").toPath.toAbsolutePath
+    val projectDir = Paths.get(namespace.get[File]("build_file_path")
+      .toPath.toAbsolutePath
+      .toString.replace("BUILD", ""))
 
-    // extract upstream classes
-    val classesDir = tmpDir.resolve("classes")
-    val outputJar = namespace.get[File]("output_jar").toPath
+    val label = namespace.getString("label")
+    val srcs = namespace.getList[File]("sources").asScala.toList.map(_.toPath)
 
-    val deps = {
-      val analyses = Option(
-        namespace
-          .getList[JList[String]]("analysis")
-      ).fold[Seq[JList[String]]](Nil)(_.asScala)
-        .flatMap { value =>
-          val prefixedLabel +: apis +: relations +: jars = value.asScala.toList
-          val label = prefixedLabel.stripPrefix("_")
-          jars
-            .map(
-              jar =>
-                Paths.get(jar) -> (classesDir
-                  .resolve(labelToPath(label)), DepAnalysisFiles(Paths.get(apis), Paths.get(relations)))
-            )
-        }
-        .toMap
-      val originalClasspath = namespace.getList[File]("classpath").asScala.map(_.toPath)
-      Dep.create(originalClasspath, analyses)
-    }
+    println(workspaceDir, label, srcs)
 
-    // load persisted files
-    val analysisFiles = AnalysisFiles(
-      apis = namespace.get[File]("output_apis").toPath,
-      miniSetup = namespace.get[File]("output_setup").toPath,
-      relations = namespace.get[File]("output_relations").toPath,
-      sourceInfos = namespace.get[File]("output_infos").toPath,
-      stamps = namespace.get[File]("output_stamps").toPath
-    )
-    val analysesFormat = {
-      val debug = namespace.getBoolean("debug")
-      val format = if (debug) AnxAnalysisStore.TextFormat else AnxAnalysisStore.BinaryFormat
-      new AnxAnalyses(format)
-    }
-    val analysisStore = new AnxAnalysisStore(analysisFiles, analysesFormat)
 
-    val persistence = Option(worker.getString("persistence_dir")).fold[ZincPersistence](NullPersistence) { dir =>
-      val rootDir = Paths.get(dir.replace("~", sys.props.getOrElse("user.home", "")))
-      val path = namespace.getString("label").replaceAll("^/+", "").replaceAll(raw"[^\w/]", "_")
-      new FilePersistence(rootDir.resolve(path), analysisFiles, outputJar)
-    }
+    //TODO could do query to find deps? Actually maybe that is passed in with depset?
+    //Make sure there is an open BSP connection with the Bloop server. Otherwise use Bloop Launcher
 
-    val classesOutputDir = classesDir.resolve(labelToPath(namespace.getString("label")))
-    try {
-      persistence.load()
-      if (Files.exists(outputJar)) {
-        try FileUtil.extractZip(outputJar, classesOutputDir)
-        catch {
-          case NonFatal(e) =>
-            FileUtil.delete(classesOutputDir)
-            throw e
-        }
-      }
-    } catch {
-      case NonFatal(e) =>
-        logger.warn(() => s"Failed to load cached analysis: $e")
-        Files.delete(analysisFiles.apis)
-        Files.delete(analysisFiles.miniSetup)
-        Files.delete(analysisFiles.relations)
-        Files.delete(analysisFiles.sourceInfos)
-        Files.delete(analysisFiles.stamps)
-    }
-    Files.createDirectories(classesOutputDir)
+    val projectName = label.replaceAll("^/+", "")
 
-    val previousResult = Try(analysisStore.get())
-      .fold({ e =>
-        logger.warn(() => s"Failed to load previous analysis: $e")
-        Optional.empty[AnalysisContents]()
-      }, identity)
-      .map[PreviousResult](
-        contents => PreviousResult.of(Optional.of(contents.getAnalysis), Optional.of(contents.getMiniSetup))
+    val bloopDir = workspaceDir.resolve(".bloop").toAbsolutePath
+    val bloopOutDir = bloopDir.resolve("out").toAbsolutePath
+    val projectOutDir = bloopOutDir.resolve(projectName).toAbsolutePath
+    val projectClassesDir = projectOutDir.resolve("classes").toAbsolutePath
+    Files.createDirectories(projectClassesDir)
+
+
+    val bloopConfigPath = bloopDir.resolve(s"$projectName.json")
+
+    println("analysis", namespace.getList[JList[String]]("analysis"))
+    val scalaJars = namespace.getList[File]("compiler_classpath").asScala.map(_.toPath.toAbsolutePath).toList
+    val bloopConfig = BloopConfig.File(
+      version = BloopConfig.File.LatestVersion,
+      project = BloopConfig.Project(
+        name = projectName,
+        directory = projectDir,
+        sources = srcs,
+        dependencies = List(), //Similar logic as in ZincRunner I think
+        classpath = scalaJars, //TODO Add classpath of deps. need to filter this but how do I know?
+        out = projectOutDir,
+        classesDir = projectClassesDir,
+        resources = None,
+        `scala` = Some(Scala("org.scala-lang", "scala-compiler", "2.12.18", List(), scalaJars, None, None)),
+        java = None,
+        sbt = None,
+        test = None,
+        platform = None,
+        resolution = None
       )
-      .orElseGet(() => PreviousResult.of(Optional.empty(), Optional.empty()))
+    )
 
-    // setup compiler
-    val scalaInstance = new AnnexScalaInstance(namespace.getList[File]("compiler_classpath").asScala.toArray)
+    println(bloop.config.toStr(bloopConfig))
+    println(bloopConfigPath.toAbsolutePath)
 
-    val compileOptions =
-      CompileOptions.create
-        .withSources(sources.map(_.getAbsoluteFile).toArray)
-        .withClasspath((classesOutputDir +: deps.map(_.classpath)).map(_.toFile).toArray)
-        .withClassesDirectory(classesOutputDir.toFile)
-        .withJavacOptions(namespace.getList[String]("java_compiler_option").asScala.toArray)
-        .withScalacOptions(
-          Array.concat(
-            namespace.getList[File]("plugins").asScala.map(p => s"-Xplugin:$p").toArray,
-            Option(namespace.getList[String]("compiler_option")).fold[Seq[String]](Nil)(_.asScala).toArray
-          )
-        )
+    Files.write(bloopConfigPath, bloop.config.toStr(bloopConfig).getBytes)
 
-    val compilers = {
-      val scalaCompiler = ZincUtil
-        .scalaCompiler(scalaInstance, namespace.get[File]("compiler_bridge"))
-        .withClassLoaderCache(classloaderCache)
-      lastCompiler = scalaCompiler
-      ZincUtil.compilers(scalaInstance, ClasspathOptionsUtil.boot, None, scalaCompiler)
-    }
+    Thread.sleep(1000)
 
-    val lookup = {
-      val depMap = deps.collect {
-        case ExternalDep(_, classpath, files) => classpath -> files
-      }.toMap
-      new AnxPerClasspathEntryLookup(file => {
-        depMap
-          .get(file)
-          .map(
-            files =>
-              Analysis.Empty.copy(
-                apis = analysesFormat.apis.read(files.apis),
-                relations = analysesFormat.relations.read(files.relations)
-              )
-          )
-      })
-    }
+    val buildTargetId = List(new BuildTargetIdentifier(s"file:///Users/syedajafri/dev/bazelExample?id=$projectName"))
+    val compileParams = new CompileParams(buildTargetId.asJava)
 
-    val setup = {
-      val incOptions = IncOptions.create()
-      val reporter = new LoggedReporter(logger)
-      val skip = false
-      Setup.create(lookup, skip, null, compilerCache, incOptions, reporter, Optional.empty(), Array.empty)
-    }
+    bloopServer.buildTargetCompile(compileParams).toScala.onComplete(cr => println(s"Compiled $projectName! $cr")) //TODO data is null here
 
-    val inputs = Inputs.of(compilers, compileOptions, setup, previousResult)
-
-    // compile
-    val incrementalCompiler = new IncrementalCompilerImpl()
-    val compileResult =
-      try incrementalCompiler.compile(inputs, logger)
-      catch {
-        case _: CompileFailed => sys.exit(-1)
-        case e: ClassFormatError =>
-          System.err.println(e)
-          println("You may be missing a `macro = True` attribute.")
-          sys.exit(1)
-      }
-
-    // create analyses
-    analysisStore.set(AnalysisContents.create(compileResult.analysis, compileResult.setup))
-
-    // create used deps
-    val analysis = compileResult.analysis.asInstanceOf[Analysis]
-    val usedDeps =
-      deps.filter(Dep.used(deps, analysis.relations, lookup)).filter(_.file != scalaInstance.libraryJar.toPath)
-    Files.write(namespace.get[File]("output_used").toPath, usedDeps.map(_.file.toString).sorted.asJava)
-
-    // create jar
-    val mains =
-      analysis.infos.allInfos.values.toList
-        .flatMap(_.getMainClasses.toList)
-        .sorted
-
-    val pw = new PrintWriter(namespace.get[File]("main_manifest"))
-    try mains.foreach(pw.println)
-    finally pw.close()
-
-    val jarCreator = new JarCreator(outputJar)
-    jarCreator.addDirectory(classesOutputDir)
-    jarCreator.setCompression(true)
-    jarCreator.setNormalize(true)
-    jarCreator.setVerbose(false)
-
-    mains match {
-      case main :: Nil =>
-        jarCreator.setMainClass(main)
-      case _ =>
-    }
-
-    jarCreator.execute()
-
-    val usePersistence: Boolean = worker.getBoolean("use_persistence") match {
-      case p: java.lang.Boolean => p
-      case _                    => true
-    }
-    // save persisted files
-    if (usePersistence) {
-      try persistence.save()
-      catch {
-        case NonFatal(e) => logger.warn(() => s"Failed to save cached analysis: $e")
-      }
-    }
-
-    // clear temporary files
-    FileUtil.delete(tmpDir)
-    Files.createDirectory(tmpDir)
   }
-}
 
-final class AnxPerClasspathEntryLookup(analyses: Path => Option[CompileAnalysis]) extends PerClasspathEntryLookup {
-  override def analysis(classpathEntry: File): Optional[CompileAnalysis] =
-    analyses(classpathEntry.toPath).fold(Optional.empty[CompileAnalysis])(Optional.of(_))
-  override def definesClass(classpathEntry: File): DefinesClass =
-    Locate.definesClass(classpathEntry)
 }

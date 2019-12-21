@@ -135,7 +135,19 @@ object CommonArguments {
       .addArgument("--tmp")
       .help("Temporary directory")
       .metavar("path")
-      .required(true)
+      .required(false)
+      .`type`(ArgumentsImpl.fileType)
+    parser
+      .addArgument("--build_file_path")
+      .help("Path to build file")
+      .metavar("path")
+      .required(false)
+      .`type`(ArgumentsImpl.fileType)
+    parser
+      .addArgument("--workspace_dir")
+      .help("Workspace directory")
+      .metavar("path")
+      .required(false)
       .`type`(ArgumentsImpl.fileType)
     parser
       .addArgument("sources")

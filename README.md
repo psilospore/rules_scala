@@ -1,5 +1,134 @@
-# higherkindness/rules_scala
+# WIP Bloop Integration with bazel
 
+A very hacky WIP bloop integration with Bazel.
+It's pretty messy in here but hopefully it won't be for long.
+
+## What I've done so far
+I'm generating a bloop config for one target then `bloop compile ABC:A` works fine
+I use bloop launcher and then I send a BSP request.
+It generates the classfiles but doesn't seem to put it in `out/ABC:A/classes/` like a specify
+instead it can be found in `out/ABC:A/bloop-internal-classes/`
+
+
+A `.bloop` directory is made in the workspace.
+Given we have a project with 4 targets and 3 scala files with the following structure
+
+```
+ABC/
+    BUILD: containing targets A, B, C, and C_run
+    src/
+        A.scala
+        B.scala (depends on A)
+        C.scala (depends on B and has main)
+```
+
+and the BUILD file looks like so:
+
+```
+load("@rules_scala_annex//rules:scala.bzl", "scala_binary", "scala_library")
+
+scala_binary(
+    name = "C_run",
+    srcs = glob(["C.scala"]),
+    visibility = ["//visibility:public"],
+    deps = ["C"]
+)
+
+scala_library(
+    name = "C",
+    srcs = glob(["C.scala"]),
+    visibility = ["//visibility:public"],
+    deps = ["B"]
+)
+
+scala_library(
+    name = "B",
+    srcs = glob(["B.scala"]),
+    visibility = ["//visibility:public"],
+    deps = ["A"]
+)
+
+scala_library(
+    name = "A",
+    srcs = glob(["A.scala"]),
+    visibility = ["//visibility:public"]
+)
+```
+
+I want to generate the following:
+
+```
+.bloop/
+    ABC:A.json
+    ABC:B.json
+    ABC:C.json
+    ABC:C_run.json
+    out/
+        ABC:A/
+            classes/
+                A.class
+        ABC:B/
+            classes/
+                B.class
+        ABC:C/
+            classes/
+                C.class
+        ABC:C_run/ (Not sure if this will contain classes
+```
+
+You can see the project I'm testing it on here: https://github.com/psilospore/local_rules_scala
+
+Each of the json files are bloop config files and each target has a config file associated with it.
+
+Example ABC:B.json will look something like this
+
+```json
+{
+    "version" : "1.1.2",
+    "project" : {
+        "name" : "ABC:B",
+        "directory" : "/Users/syedajafri/dev/bazelExample/ABC",
+        "sources" : [
+            "/Users/syedajafri/dev/bazelExample/ABC/B.scala"
+        ],
+        "dependencies" : [
+             "ABC:A" 
+        ],
+        "classpath" : [
+             "/Users/syedajafri/dev/bazelExample/.bloop/out/ABC:A/classes"
+        ],
+        "out" : "/Users/syedajafri/dev/bazelExample/.bloop/out/ABC:B",
+        "classesDir" : "/Users/syedajafri/dev/bazelExample/.bloop/out/ABC:B/classes",
+        "scala" : { ... }
+    }
+}
+```
+
+You can see B has a dependency on A and the classpath has A's generated class files. `ABC:C.json` would look similar to this.
+
+At this point you can then run `bloop compile ABC:A` or any of the other targets and it would send a BSP request to Bloop I believe.
+
+We could also send a BSP request to compile ourselves. 
+
+
+## WIP
+
+I don't know bazel very well so some pointers would be really appreciated.
+There's a bunch of hardcoded values and printlns.
+
+
+I couldn't figure out how to invoke BloopRunner so I put most of my code in ZincRunner.scala.
+
+
+### TODOs
+* Move to BloopRunner and figure out how to invoke it
+* Pass args correctly
+* Invoke BloopLauncher correctly
+* Get deps
+* Remove 
+
+
+# OG Docs
 [![Build Status](https://api.travis-ci.org/higherkindness/rules_scala.svg?branch=master)](https://travis-ci.org/higherkindness/rules_scala)
 
 `higherkindness/rules_scala` evolved, in part, from the need for Bazel adoption support for large, monorepo Scala projects.
