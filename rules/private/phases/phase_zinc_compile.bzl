@@ -79,7 +79,9 @@ def phase_zinc_compile(ctx, g):
         ] + [zinc.deps_files for zinc in zincs],
     )
 
-    outputs = [g.classpaths.jar, mains_file, apis, infos, relations, setup, stamps, used, tmp]
+    print("hai")
+    print(g)
+    outputs = [mains_file] #[g.classpaths.jar, mains_file, apis, infos, relations, setup, stamps, used, tmp]
 
     # todo: different execution path for nosrc jar?
     ctx.actions.run(

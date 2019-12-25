@@ -1,14 +1,11 @@
 # WIP Bloop Integration with bazel
 
+First read this: https://jvican.github.io/posts/integrate-bloop-with-bazel-and-pants.html
+
 A very hacky WIP bloop integration with Bazel.
 It's pretty messy in here but hopefully it won't be for long.
 
 ## What I've done so far
-I'm generating a bloop config for one target then `bloop compile ABC:A` works fine
-I use bloop launcher and then I send a BSP request.
-It generates the classfiles but doesn't seem to put it in `out/ABC:A/classes/` like a specify
-instead it can be found in `out/ABC:A/bloop-internal-classes/`
-
 
 A `.bloop` directory is made in the workspace.
 Given we have a project with 4 targets and 3 scala files with the following structure
@@ -76,7 +73,7 @@ I want to generate the following:
         ABC:C_run/ (Not sure if this will contain classes
 ```
 
-You can see the project I'm testing it on here: https://github.com/psilospore/local_rules_scala
+This is the example project I'm testing it on: https://github.com/psilospore/local_rules_scala
 
 Each of the json files are bloop config files and each target has a config file associated with it.
 
@@ -108,7 +105,7 @@ You can see B has a dependency on A and the classpath has A's generated class fi
 
 At this point you can then run `bloop compile ABC:A` or any of the other targets and it would send a BSP request to Bloop I believe.
 
-We could also send a BSP request to compile ourselves. 
+We could also send a BSP request to compile ourselves
 
 
 ## WIP
@@ -122,10 +119,6 @@ I couldn't figure out how to invoke BloopRunner so I put most of my code in Zinc
 
 ### TODOs
 * Move to BloopRunner and figure out how to invoke it
-* Pass args correctly
-* Invoke BloopLauncher correctly
-* Get deps
-* Remove 
 
 
 # OG Docs
